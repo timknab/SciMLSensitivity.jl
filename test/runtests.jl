@@ -137,6 +137,7 @@ run_tests(;
                 @time @safetestset "Continuous vs. discrete Callbacks" include("Callbacks2/continuous_vs_discrete.jl")
                 @time @safetestset "Continuous Callbacks with Adjoints" include("Callbacks2/continuous_callbacks.jl")
                 @time @safetestset "VectorContinuousCallbacks with Adjoints" include("Callbacks2/vector_continuous_callbacks.jl")
+                @time @safetestset "Callback-aware adjoint replay" include("Callbacks2/callback_adjoint_replay.jl")
             end
         end,
         "Shadowing" => function ()
