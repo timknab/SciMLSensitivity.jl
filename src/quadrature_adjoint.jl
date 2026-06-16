@@ -518,9 +518,10 @@ function _adjoint_sensitivities(
         callback = CallbackSet(),
         kwargs...
     )
+    forward_sol = event_replay_solution(sol, callback, alg, abstol, reltol)
     adj_prob,
         rcb = ODEAdjointProblem(
-        sol, sensealg, alg, t, dgdu_discrete, dgdp_discrete,
+        forward_sol, sensealg, alg, t, dgdu_discrete, dgdp_discrete,
         dgdu_continuous, dgdp_continuous, g, Val(true);
         callback, no_start
     )
@@ -529,31 +530,34 @@ function _adjoint_sensitivities(
         save_everystep = true, save_start = true, kwargs...
     )
 
-    p = sol.prob.p
+    p = forward_sol.prob.p
     if p === nothing || p === SciMLBase.NullParameters()
         return state_values(adj_sol)[end], nothing
     else
-        integrand = AdjointSensitivityIntegrand(sol, adj_sol, sensealg, dgdp_continuous)
+        integrand = AdjointSensitivityIntegrand(
+            forward_sol, adj_sol, sensealg, dgdp_continuous
+        )
         if t === nothing
             res,
                 err = quadgk(
-                integrand, sol.prob.tspan[1], sol.prob.tspan[2],
+                integrand, forward_sol.prob.tspan[1], forward_sol.prob.tspan[2],
                 atol = abstol, rtol = reltol
             )
         else
             res = zero(integrand.tunables)'
+            event_times = callback_event_times(callback, eltype(t))
+            sensitivity_times = isempty(event_times) ? t :
+                                sort!(unique!(vcat(collect(t), event_times)))
 
             # handle discrete dgdp contributions
             if dgdp_discrete !== nothing
                 (; y) = integrand
-                cur_time = length(t)
                 dgdp_cache = copy(res)
-                dgdp_discrete(dgdp_cache, y, p, t[cur_time], cur_time)
+                dgdp_discrete(dgdp_cache, y, p, t[end], length(t))
                 res .+= dgdp_cache
             end
 
             if callback !== nothing
-                cur_time = length(t)
                 dλ = similar(integrand.λ)
                 dλ .*= false
                 dgrad = similar(res)
@@ -561,55 +565,60 @@ function _adjoint_sensitivities(
             end
 
             # correction for end interval.
-            if t[end] != sol.prob.tspan[2] && sol.retcode !== ReturnCode.Terminated
+            if sensitivity_times[end] != forward_sol.prob.tspan[2] &&
+                    forward_sol.retcode !== ReturnCode.Terminated
                 res .+= quadgk(
-                    integrand, t[end], sol.prob.tspan[end],
+                    integrand, sensitivity_times[end], forward_sol.prob.tspan[end],
                     atol = abstol, rtol = reltol
                 )[1]
             end
 
-            if sol.retcode === ReturnCode.Terminated
+            if forward_sol.retcode === ReturnCode.Terminated
+                loss_idx = searchsortedlast(t, sensitivity_times[end])
+                loss_idx = loss_idx >= firstindex(t) &&
+                    t[loss_idx] == sensitivity_times[end] ? loss_idx : nothing
                 integrand = update_integrand_and_dgrad(
                     res, sensealg, callback, integrand,
-                    adj_prob, sol, dgdu_discrete,
-                    dgdp_discrete, dλ, dgrad, t[end],
-                    cur_time
+                    adj_prob, forward_sol, dgdu_discrete,
+                    dgdp_discrete, dλ, dgrad, sensitivity_times[end],
+                    loss_idx
                 )
             end
 
-            for i in (length(t) - 1):-1:1
+            for i in (length(sensitivity_times) - 1):-1:1
                 if ArrayInterface.ismutable(res)
                     res .+= quadgk(
-                        integrand, t[i], t[i + 1],
+                        integrand, sensitivity_times[i], sensitivity_times[i + 1],
                         atol = abstol, rtol = reltol
                     )[1]
                 else
                     res += quadgk(
-                        integrand, t[i], t[i + 1],
+                        integrand, sensitivity_times[i], sensitivity_times[i + 1],
                         atol = abstol, rtol = reltol
                     )[1]
                 end
-                if t[i] == t[i + 1]
+                loss_idx = searchsortedlast(t, sensitivity_times[i])
+                loss_idx = loss_idx >= firstindex(t) &&
+                    t[loss_idx] == sensitivity_times[i] ? loss_idx : nothing
+                if sensitivity_times[i] ∈ event_times
                     integrand = update_integrand_and_dgrad(
                         res, sensealg, callback,
                         integrand,
-                        adj_prob, sol, dgdu_discrete,
-                        dgdp_discrete, dλ, dgrad, t[i],
-                        cur_time
+                        adj_prob, forward_sol, dgdu_discrete,
+                        dgdp_discrete, dλ, dgrad, sensitivity_times[i],
+                        loss_idx
                     )
                 end
-                if dgdp_discrete !== nothing
+                if dgdp_discrete !== nothing && loss_idx !== nothing
                     (; y) = integrand
-                    dgdp_discrete(dgdp_cache, y, p, t[cur_time], cur_time)
+                    dgdp_discrete(dgdp_cache, y, p, t[loss_idx], loss_idx)
                     res .+= dgdp_cache
                 end
-                (callback !== nothing || dgdp_discrete !== nothing) &&
-                    (cur_time -= one(cur_time))
             end
             # correction for start interval
-            if t[1] != sol.prob.tspan[1]
+            if sensitivity_times[1] != forward_sol.prob.tspan[1]
                 res .+= quadgk(
-                    integrand, sol.prob.tspan[1], t[1],
+                    integrand, forward_sol.prob.tspan[1], sensitivity_times[1],
                     atol = abstol, rtol = reltol
                 )[1]
             end
@@ -622,7 +631,7 @@ function _adjoint_sensitivities(
             for (Δλa, tt) in rcb.Δλas
                 (; algevar_idxs) = rcb.diffcache
                 iλ[algevar_idxs] .= Δλa
-                sol(yy, tt)
+                forward_sol(yy, tt)
                 vec_pjac!(out, iλ, yy, tt, integrand)
                 res .+= out'
                 iλ .= zero(eltype(iλ))
@@ -688,52 +697,65 @@ function _update_integrand_and_dgrad(
         res, sensealg::QuadratureAdjoint, cb, integrand,
         adj_prob, sol, dgdu, dgdp, dλ, dgrad, t, cur_time
     )
+    if ArrayInterface.ismutable(integrand.y)
+        integrand.sol(integrand.y, t)
+        integrand.adj_sol(integrand.λ, t)
+    else
+        integrand = AdjointSensitivityIntegrand(
+            integrand.sol, integrand.adj_sol, integrand.p,
+            integrand.sol(t), integrand.adj_sol(t), integrand.pf,
+            integrand.f_cache, integrand.pJ, integrand.paramjac_config,
+            integrand.sensealg, integrand.dgdp_cache, integrand.dgdp,
+            integrand.tunables, integrand.repack
+        )
+    end
+
     indx, pos_neg = get_indx(cb, t)
     tprev = get_tprev(cb, indx, pos_neg)
 
-    # Callbacks always use ReverseDiffVJP for their VJP computations,
-    # independent of the ODE adjoint's autojacvec choice.
-    cb_autojacvec = ReverseDiffVJP()
+    cb_autojacvec = supports_callback_vjp(sensealg.autojacvec) ?
+                    sensealg.autojacvec : ReverseDiffVJP()
     cb_sensealg = setvjp(sensealg, cb_autojacvec)
+    event_idxs = cb isa VectorContinuousCallback ?
+        get_event_idx(cb, indx, pos_neg) : nothing
+    cache_key = cb isa VectorContinuousCallback ? (pos_neg, indx) :
+        (pos_neg, nothing)
+    diffcaches = get_cb_diffcaches(cb, cb_autojacvec)
 
-    wp = CallbackAffectPWrapper(cb, cb_autojacvec, pos_neg, nothing, tprev)
+    wp = CallbackAffectPWrapper(cb, cb_autojacvec, pos_neg, event_idxs, tprev)
 
     _p = similar(integrand.p, size(integrand.p))
     _p .= false
     wp(_p, integrand.y, integrand.p, t)
 
-    if _p != integrand.p
-        paramjac_config = _get_wp_paramjac_config(
-            cb_autojacvec, integrand.p, wp, integrand.y, integrand.p, t
-        )
-        pf = get_pf(cb_autojacvec; _f = wp, isinplace = true, isRODE = false)
-        if cb_autojacvec isa EnzymeVJP
-            paramjac_config = (paramjac_config..., Enzyme.make_zero(pf), nothing)
-        end
+    w = CallbackAffectWrapper(cb, cb_autojacvec, pos_neg, event_idxs, tprev)
+    _y = copy(integrand.y)
+    w(_y, _y, integrand.p, t)
+    _is_noop = _p == integrand.p && _y == integrand.y
+    _is_noop && return integrand
 
-        diffcache_wp = AdjointDiffCache(
-            nothing, pf, nothing, nothing, nothing,
-            nothing, nothing, nothing, paramjac_config,
-            nothing, nothing, nothing, nothing, nothing,
-            nothing, nothing, nothing, false,
-            nothing, identity
-        )
+    if _p != integrand.p
+        diffcache_wp = diffcaches[cache_key][2]
 
         fakeSp = CallbackSensitivityFunctionPSwap(wp, cb_sensealg, diffcache_wp, sol.prob)
         #vjp with Jacobin given by dw/dp before event and vector given by grad
+        res_vec = copy(vec(res))
+        dgrad_p = similar(integrand.tunables)
+        dgrad_p .*= false
         vecjacobian!(
-            nothing, integrand.y, res, integrand.p, t, fakeSp;
-            dgrad = res, dy = nothing
+            nothing, integrand.y, res_vec, integrand.p, t, fakeSp;
+            dgrad = dgrad_p, dy = nothing
         )
+        res .= dgrad_p'
         integrand = update_p_integrand(integrand, _p)
     end
 
-    w = CallbackAffectWrapper(cb, cb_autojacvec, pos_neg, nothing, tprev)
-
     # Create a fake sensitivity function to do the vjps needs to be done
     # to account for parameter dependence of affect function
-    fakeS = CallbackSensitivityFunction(w, cb_sensealg, adj_prob.f.f.diffcache, sol.prob)
-    if dgdu !== nothing # discrete cost
+    fakeS = CallbackSensitivityFunction(w, cb_sensealg, diffcaches[cache_key][1], sol.prob)
+    if cur_time === nothing
+        dλ .*= false
+    elseif dgdu !== nothing # discrete cost
         dgdu(dλ, integrand.y, integrand.p, t, cur_time)
     else
         error("Please provide `dgdu` to use adjoint_sensitivities with `QuadratureAdjoint()` and callbacks.")
@@ -744,7 +766,9 @@ function _update_integrand_and_dgrad(
     # account for implicit events
 
     @. dλ = -dλ - integrand.λ
-    vecjacobian!(dλ, integrand.y, dλ, integrand.p, t, fakeS; dgrad)
-    res .-= dgrad
+    dgrad_p = similar(integrand.tunables)
+    dgrad_p .*= false
+    vecjacobian!(dλ, integrand.y, dλ, integrand.p, t, fakeS; dgrad = dgrad_p)
+    res .-= dgrad_p'
     return integrand
 end

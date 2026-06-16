@@ -17,12 +17,13 @@ struct ODEInterpolatingAdjointSensitivityFunction{
     noiseterm::Bool
 end
 
-mutable struct CheckpointSolution{S, I, T, T2}
+mutable struct CheckpointSolution{S, I, T, T2, T3}
     cpsol::S # solution in a checkpoint interval
     intervals::I # checkpoint intervals
     cursor::Int # sol.prob.tspan = intervals[cursor]
     tols::T
     tstops::T2 # for callbacks
+    callback::T3 # tracked forward callback for local checkpoint reconstruction
 end
 
 function ODEInterpolatingAdjointSensitivityFunction(
@@ -30,11 +31,13 @@ function ODEInterpolatingAdjointSensitivityFunction(
         f, alg,
         checkpoints, tols, tstops = nothing;
         noiseterm = false,
+        callback = CallbackSet(),
         tspan = reverse(sol.prob.tspan)
     )
     checkpointing = ischeckpointing(sensealg, sol)
     (checkpointing && checkpoints === nothing) &&
         error("checkpoints must be passed when checkpointing is enabled.")
+    checkpoint_callback = callback_with_saved_positions(callback)
 
     checkpoint_sol = if checkpointing
         intervals = map(tuple, @view(checkpoints[1:(end - 1)]), @view(checkpoints[2:end]))
@@ -53,19 +56,19 @@ function ODEInterpolatingAdjointSensitivityFunction(
         else
             if maximum(interval[1] .< tstops .< interval[2])
                 # callback might have changed p
-                _p = reset_p(sol.prob.kwargs[:callback], interval)
+                _p = reset_p(callback, interval)
                 cpsol = solve(
                     remake(sol.prob, tspan = interval, u0 = sol(interval[1]));
-                    tstops, p = _p, sol.alg, tols...
+                    callback = checkpoint_callback, tstops, p = _p, sol.alg, tols...
                 )
             else
                 cpsol = solve(
                     remake(sol.prob, tspan = interval, u0 = sol(interval[1]));
-                    tstops, sol.alg, tols...
+                    callback = checkpoint_callback, tstops, sol.alg, tols...
                 )
             end
         end
-        CheckpointSolution(cpsol, intervals, cursor, tols, tstops)
+        CheckpointSolution(cpsol, intervals, cursor, tols, tstops, checkpoint_callback)
     else
         nothing
     end
@@ -187,11 +190,12 @@ function split_states(
                 else
                     if maximum(interval[1] .< checkpoint_sol.tstops .< interval[2])
                         # callback might have changed p
-                        _p = reset_p(prob.kwargs[:callback], interval)
+                        _p = reset_p(checkpoint_sol.callback, interval)
                         prob′ = remake(prob, tspan = intervals[cursor′], u0 = y, p = _p)
                         cpsol′ = solve(
                             prob′, sol.alg;
                             dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
+                            callback = checkpoint_sol.callback,
                             tstops = checkpoint_sol.tstops,
                             checkpoint_sol.tols...
                         )
@@ -200,6 +204,7 @@ function split_states(
                         cpsol′ = solve(
                             prob′, sol.alg;
                             dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
+                            callback = checkpoint_sol.callback,
                             tstops = checkpoint_sol.tstops,
                             checkpoint_sol.tols...
                         )
@@ -259,6 +264,7 @@ end
                with a discrete cost function but no specified `dgdu_discrete` or `dgdp_discrete`.
                Please use the higher level `solve` interface or specify these two contributions.")
 
+    sol = event_replay_solution(sol, callback, alg, abstol, reltol)
     (; tspan) = sol.prob
     p = parameter_values(sol.prob)
     u0 = state_values(sol.prob)
@@ -296,11 +302,17 @@ end
     )
 
     # remove duplicates from checkpoints
+    callback_tstops = callback_event_times(callback, eltype(checkpoints))
+
     if ischeckpointing(sensealg, sol) &&
             (length(unique(checkpoints)) != length(checkpoints))
         _checkpoints, duplicate_iterator_times = separate_nonunique(checkpoints)
         tstops = duplicate_iterator_times[1]
         checkpoints = filter(x -> x ∉ tstops, _checkpoints)
+        if !isempty(callback_tstops)
+            append!(tstops, callback_tstops)
+            sort!(unique!(tstops))
+        end
         # check if start is in checkpoints. Otherwise first interval is missed.
         if checkpoints[1] != tspan[2]
             pushfirst!(checkpoints, tspan[2])
@@ -315,7 +327,7 @@ end
             push!(checkpoints, tspan[1])
         end
     else
-        tstops = nothing
+        tstops = isempty(callback_tstops) ? nothing : callback_tstops
     end
 
     numstates = length(u0)
@@ -332,7 +344,7 @@ end
         dgdu_continuous, dgdp_continuous, f,
         alg, checkpoints,
         (; reltol, abstol),
-        tstops; tspan
+        tstops; tspan, callback
     )
 
     init_cb = (discrete || dgdu_discrete !== nothing)
@@ -691,7 +703,10 @@ function reset_p(CBS, interval)
 
     if !isempty(CBS.continuous_callbacks)
         ts2 = map(CBS.continuous_callbacks) do cb
-            if !isempty(cb.affect!.event_times) && isempty(cb.affect_neg!.event_times)
+            if cb isa VectorContinuousCallback
+                indx = searchsortedfirst(cb.affect!.event_times, interval[1])
+                return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
+            elseif !isempty(cb.affect!.event_times) && isempty(cb.affect_neg!.event_times)
                 indx = searchsortedfirst(cb.affect!.event_times, interval[1])
                 return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
             elseif isempty(cb.affect!.event_times) && !isempty(cb.affect_neg!.event_times)

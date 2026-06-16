@@ -434,7 +434,10 @@ function Gaussreset_p(CBS, interval)
 
     if !isempty(CBS.continuous_callbacks)
         ts2 = map(CBS.continuous_callbacks) do cb
-            if !isempty(cb.affect!.event_times) && isempty(cb.affect_neg!.event_times)
+            if cb isa VectorContinuousCallback
+                indx = searchsortedfirst(cb.affect!.event_times, interval[1])
+                return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
+            elseif !isempty(cb.affect!.event_times) && isempty(cb.affect_neg!.event_times)
                 indx = searchsortedfirst(cb.affect!.event_times, interval[1])
                 return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
             elseif isempty(cb.affect!.event_times) && !isempty(cb.affect_neg!.event_times)
