@@ -165,8 +165,9 @@ function event_replay_solution(sol, callback, alg, abstol, reltol)
 
     replay_callback = callback === nothing ? nothing : callback_with_saved_positions(callback)
     replay_p = callback_initial_p(callback, sol.prob.p)
+    prob_kwargs = (; sol.prob.kwargs...)
     replay_prob_kwargs = replay_callback === nothing ?
-        sol.prob.kwargs : merge(sol.prob.kwargs, (; callback = replay_callback))
+        prob_kwargs : merge(prob_kwargs, (; callback = replay_callback))
     replay_prob = remake(sol.prob, u0 = sol.prob.u0, p = replay_p,
         kwargs = replay_prob_kwargs)
     solve_kwargs = (;
