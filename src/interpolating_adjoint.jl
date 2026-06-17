@@ -35,6 +35,10 @@ function ODEInterpolatingAdjointSensitivityFunction(
         tspan = reverse(sol.prob.tspan)
     )
     checkpointing = ischeckpointing(sensealg, sol)
+    if checkpointing &&
+            !isempty(callback_event_times(callback, typeof(sol.prob.tspan[1])))
+        checkpointing = false
+    end
     (checkpointing && checkpoints === nothing) &&
         error("checkpoints must be passed when checkpointing is enabled.")
     checkpoint_callback = callback_with_saved_positions(callback)
@@ -54,19 +58,13 @@ function ODEInterpolatingAdjointSensitivityFunction(
                 sol.alg; tols...
             )
         else
-            if maximum(interval[1] .< tstops .< interval[2])
-                # callback might have changed p
-                _p = reset_p(callback, interval)
-                cpsol = solve(
-                    remake(sol.prob, tspan = interval, u0 = sol(interval[1]));
-                    callback = checkpoint_callback, tstops, p = _p, sol.alg, tols...
-                )
-            else
-                cpsol = solve(
-                    remake(sol.prob, tspan = interval, u0 = sol(interval[1]));
-                    callback = checkpoint_callback, tstops, sol.alg, tols...
-                )
-            end
+            # callback replay needs the parameter state at the start of every
+            # checkpoint interval, even if the interval contains no event.
+            _p = reset_p(callback, interval)
+            cpsol = solve(
+                remake(sol.prob, tspan = interval, u0 = sol(interval[1]));
+                callback = checkpoint_callback, tstops, p = _p, sol.alg, tols...
+            )
         end
         CheckpointSolution(cpsol, intervals, cursor, tols, tstops, checkpoint_callback)
     else
@@ -188,27 +186,18 @@ function split_states(
                         checkpoint_sol.tols...
                     )
                 else
-                    if maximum(interval[1] .< checkpoint_sol.tstops .< interval[2])
-                        # callback might have changed p
-                        _p = reset_p(checkpoint_sol.callback, interval)
-                        prob′ = remake(prob, tspan = intervals[cursor′], u0 = y, p = _p)
-                        cpsol′ = solve(
-                            prob′, sol.alg;
-                            dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
-                            callback = checkpoint_sol.callback,
-                            tstops = checkpoint_sol.tstops,
-                            checkpoint_sol.tols...
-                        )
-                    else
-                        prob′ = remake(prob, tspan = intervals[cursor′], u0 = y)
-                        cpsol′ = solve(
-                            prob′, sol.alg;
-                            dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
-                            callback = checkpoint_sol.callback,
-                            tstops = checkpoint_sol.tstops,
-                            checkpoint_sol.tols...
-                        )
-                    end
+                    # callback replay needs the parameter state at the start of
+                    # every checkpoint interval, even if the interval contains
+                    # no event.
+                    _p = reset_p(checkpoint_sol.callback, interval)
+                    prob′ = remake(prob, tspan = intervals[cursor′], u0 = y, p = _p)
+                    cpsol′ = solve(
+                        prob′, sol.alg;
+                        dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
+                        callback = checkpoint_sol.callback,
+                        tstops = checkpoint_sol.tstops,
+                        checkpoint_sol.tols...
+                    )
                 end
                 checkpoint_sol.cpsol = cpsol′
                 checkpoint_sol.cursor = cursor′
@@ -692,81 +681,10 @@ end
 end
 
 function reset_p(CBS, interval)
-    # check which events are close to tspan[1]
-    if !isempty(CBS.discrete_callbacks)
-        ts = map(CBS.discrete_callbacks) do cb
-            indx = searchsortedfirst(cb.affect!.event_times, interval[1])
-            (indx, cb.affect!.event_times[indx])
-        end
-        perm = minimum(sortperm([t for t in getindex.(ts, 2)]))
-    end
-
-    if !isempty(CBS.continuous_callbacks)
-        ts2 = map(CBS.continuous_callbacks) do cb
-            if cb isa VectorContinuousCallback
-                indx = searchsortedfirst(cb.affect!.event_times, interval[1])
-                return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
-            elseif !isempty(cb.affect!.event_times) && isempty(cb.affect_neg!.event_times)
-                indx = searchsortedfirst(cb.affect!.event_times, interval[1])
-                return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
-            elseif isempty(cb.affect!.event_times) && !isempty(cb.affect_neg!.event_times)
-                indx = searchsortedfirst(cb.affect_neg!.event_times, interval[1])
-                return (indx, cb.affect_neg!.event_times[indx], 1) # one for affect_neg!
-            elseif !isempty(cb.affect!.event_times) && !isempty(cb.affect_neg!.event_times)
-                indx1 = searchsortedfirst(cb.affect!.event_times, interval[1])
-                indx2 = searchsortedfirst(cb.affect_neg!.event_times, interval[1])
-                if cb.affect!.event_times[indx1] < cb.affect_neg!.event_times[indx2]
-                    return (indx1, cb.affect!.event_times[indx1], 0)
-                else
-                    return (indx2, cb.affect_neg!.event_times[indx2], 1)
-                end
-            else
-                error("Expected event but reset_p couldn't find event time. Please report this error.")
-            end
-        end
-        perm2 = minimum(sortperm([t for t in getindex.(ts2, 2)]))
-        # check if continuous or discrete callback was applied first if both occur in interval
-        if isempty(CBS.discrete_callbacks)
-            if ts2[perm2][3] == 0
-                p = deepcopy(CBS.continuous_callbacks[perm2].affect!.pleft[getindex.(ts2, 1)[perm2]])
-            else
-                p = deepcopy(
-                    CBS.continuous_callbacks[perm2].affect_neg!.pleft[
-                        getindex.(
-                            ts2,
-                            1
-                        )[perm2],
-                    ]
-                )
-            end
-        else
-            if ts[perm][2] < ts2[perm2][2]
-                p = deepcopy(CBS.discrete_callbacks[perm].affect!.pleft[getindex.(ts, 1)[perm]])
-            else
-                if ts2[perm2][3] == 0
-                    p = deepcopy(
-                        CBS.continuous_callbacks[perm2].affect!.pleft[
-                            getindex.(
-                                ts2,
-                                1
-                            )[perm2],
-                        ]
-                    )
-                else
-                    p = deepcopy(
-                        CBS.continuous_callbacks[perm2].affect_neg!.pleft[
-                            getindex.(
-                                ts2,
-                                1
-                            )[perm2],
-                        ]
-                    )
-                end
-            end
-        end
-    else
-        p = deepcopy(CBS.discrete_callbacks[perm].affect!.pleft[getindex.(ts, 1)[perm]])
-    end
-
+    p = callback_interval_start_p(CBS, interval)
+    p === nothing && error(
+        "Expected callback event in checkpoint interval $interval, but no tracked " *
+        "callback event was available. Please report this error."
+    )
     return p
 end

@@ -537,6 +537,10 @@ function _adjoint_sensitivities(
         integrand = AdjointSensitivityIntegrand(
             forward_sol, adj_sol, sensealg, dgdp_continuous
         )
+        callback === nothing ||
+            (integrand = update_p_integrand(
+                integrand, callback_final_p(callback, integrand.p)
+            ))
         if t === nothing
             res,
                 err = quadgk(
@@ -553,7 +557,7 @@ function _adjoint_sensitivities(
             if dgdp_discrete !== nothing
                 (; y) = integrand
                 dgdp_cache = copy(res)
-                dgdp_discrete(dgdp_cache, y, p, t[end], length(t))
+                dgdp_discrete(dgdp_cache, y, integrand.p, t[end], length(t))
                 res .+= dgdp_cache
             end
 
@@ -611,7 +615,7 @@ function _adjoint_sensitivities(
                 end
                 if dgdp_discrete !== nothing && loss_idx !== nothing
                     (; y) = integrand
-                    dgdp_discrete(dgdp_cache, y, p, t[loss_idx], loss_idx)
+                    dgdp_discrete(dgdp_cache, y, integrand.p, t[loss_idx], loss_idx)
                     res .+= dgdp_cache
                 end
             end

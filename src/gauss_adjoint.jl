@@ -514,82 +514,11 @@ end
 end
 
 function Gaussreset_p(CBS, interval)
-    # check which events are close to tspan[1]
-    if !isempty(CBS.discrete_callbacks)
-        ts = map(CBS.discrete_callbacks) do cb
-            indx = searchsortedfirst(cb.affect!.event_times, interval[1])
-            (indx, cb.affect!.event_times[indx])
-        end
-        perm = minimum(sortperm([t for t in getindex.(ts, 2)]))
-    end
-
-    if !isempty(CBS.continuous_callbacks)
-        ts2 = map(CBS.continuous_callbacks) do cb
-            if cb isa VectorContinuousCallback
-                indx = searchsortedfirst(cb.affect!.event_times, interval[1])
-                return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
-            elseif !isempty(cb.affect!.event_times) && isempty(cb.affect_neg!.event_times)
-                indx = searchsortedfirst(cb.affect!.event_times, interval[1])
-                return (indx, cb.affect!.event_times[indx], 0) # zero for affect!
-            elseif isempty(cb.affect!.event_times) && !isempty(cb.affect_neg!.event_times)
-                indx = searchsortedfirst(cb.affect_neg!.event_times, interval[1])
-                return (indx, cb.affect_neg!.event_times[indx], 1) # one for affect_neg!
-            elseif !isempty(cb.affect!.event_times) && !isempty(cb.affect_neg!.event_times)
-                indx1 = searchsortedfirst(cb.affect!.event_times, interval[1])
-                indx2 = searchsortedfirst(cb.affect_neg!.event_times, interval[1])
-                if cb.affect!.event_times[indx1] < cb.affect_neg!.event_times[indx2]
-                    return (indx1, cb.affect!.event_times[indx1], 0)
-                else
-                    return (indx2, cb.affect_neg!.event_times[indx2], 1)
-                end
-            else
-                error("Expected event but reset_p couldn't find event time. Please report this error.")
-            end
-        end
-        perm2 = minimum(sortperm([t for t in getindex.(ts2, 2)]))
-        # check if continuous or discrete callback was applied first if both occur in interval
-        if isempty(CBS.discrete_callbacks)
-            if ts2[perm2][3] == 0
-                p = deepcopy(CBS.continuous_callbacks[perm2].affect!.pleft[getindex.(ts2, 1)[perm2]])
-            else
-                p = deepcopy(
-                    CBS.continuous_callbacks[perm2].affect_neg!.pleft[
-                        getindex.(
-                            ts2,
-                            1
-                        )[perm2],
-                    ]
-                )
-            end
-        else
-            if ts[perm][2] < ts2[perm2][2]
-                p = deepcopy(CBS.discrete_callbacks[perm].affect!.pleft[getindex.(ts, 1)[perm]])
-            else
-                if ts2[perm2][3] == 0
-                    p = deepcopy(
-                        CBS.continuous_callbacks[perm2].affect!.pleft[
-                            getindex.(
-                                ts2,
-                                1
-                            )[perm2],
-                        ]
-                    )
-                else
-                    p = deepcopy(
-                        CBS.continuous_callbacks[perm2].affect_neg!.pleft[
-                            getindex.(
-                                ts2,
-                                1
-                            )[perm2],
-                        ]
-                    )
-                end
-            end
-        end
-    else
-        p = deepcopy(CBS.discrete_callbacks[perm].affect!.pleft[getindex.(ts, 1)[perm]])
-    end
-
+    p = callback_interval_start_p(CBS, interval)
+    p === nothing && error(
+        "Expected callback event in checkpoint interval $interval, but no tracked " *
+        "callback event was available. Please report this error."
+    )
     return p
 end
 

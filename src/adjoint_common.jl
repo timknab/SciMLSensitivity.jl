@@ -98,6 +98,92 @@ function _callback_initial_p(tfirst, pfirst, affect)
     return tfirst, pfirst
 end
 
+function callback_final_p(callback, fallback)
+    callback === nothing && return fallback
+    tlast = nothing
+    plast = nothing
+    for cb in callback.discrete_callbacks
+        tlast, plast = _callback_final_p(tlast, plast, cb.affect!)
+    end
+    for cb in callback.continuous_callbacks
+        tlast, plast = _callback_final_p(tlast, plast, cb.affect!)
+        if hasproperty(cb, :affect_neg!)
+            tlast, plast = _callback_final_p(tlast, plast, cb.affect_neg!)
+        end
+    end
+    return plast === nothing ? fallback : deepcopy(plast)
+end
+
+function callback_final_p(
+        callback::Union{DiscreteCallback, ContinuousCallback, VectorContinuousCallback},
+        fallback
+    )
+    return callback_final_p(CallbackSet(callback), fallback)
+end
+
+function _callback_final_p(tlast, plast, affect)
+    affect === nothing && return tlast, plast
+    hasproperty(affect, :event_times) || return tlast, plast
+    hasproperty(affect, :pright) || return tlast, plast
+    isempty(affect.event_times) && return tlast, plast
+    idx = lastindex(affect.event_times)
+    t = affect.event_times[idx]
+    if tlast === nothing || t >= tlast
+        return t, affect.pright[idx]
+    end
+    return tlast, plast
+end
+
+function callback_interval_start_p(callback, interval)
+    callback === nothing && return nothing
+    candidates = []
+    order = 0
+    for cb in callback.discrete_callbacks
+        order += 1
+        _append_callback_interval_start_p!(candidates, order, cb.affect!, interval)
+    end
+    for cb in callback.continuous_callbacks
+        order += 1
+        _append_callback_interval_start_p!(candidates, order, cb.affect!, interval)
+        if hasproperty(cb, :affect_neg!)
+            order += 1
+            _append_callback_interval_start_p!(
+                candidates, order, cb.affect_neg!, interval
+            )
+        end
+    end
+    isempty(candidates) && return callback_final_p(callback, nothing)
+    sort!(candidates, by = candidate -> (candidate[1], candidate[2]))
+    return deepcopy(candidates[1][3])
+end
+
+function callback_interval_start_p(
+        callback::Union{DiscreteCallback, ContinuousCallback, VectorContinuousCallback},
+        interval
+    )
+    return callback_interval_start_p(CallbackSet(callback), interval)
+end
+
+function _append_callback_interval_start_p!(candidates, order, affect, interval)
+    affect === nothing && return candidates
+    hasproperty(affect, :event_times) || return candidates
+    hasproperty(affect, :pleft) || return candidates
+    idx = _first_callback_event_after_interval_start(affect.event_times, interval)
+    idx === nothing && return candidates
+    push!(candidates, (affect.event_times[idx], order, affect.pleft[idx]))
+    return candidates
+end
+
+function _first_callback_event_after_interval_start(event_times, interval)
+    isempty(event_times) && return nothing
+    idx = searchsortedfirst(event_times, interval[1])
+    while idx <= lastindex(event_times) && event_times[idx] <= interval[1]
+        idx += 1
+    end
+    idx > lastindex(event_times) && return nothing
+    return idx
+end
+
 callback_with_saved_positions(callback) = callback
 
 function callback_with_saved_positions(callback::CallbackSet)
