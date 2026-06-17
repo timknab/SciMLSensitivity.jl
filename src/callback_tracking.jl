@@ -62,6 +62,7 @@ struct TrackedAffect{T, T2, T3, T4, T5, T6}
     tprev::Vector{T}
     uleft::Vector{T2}
     pleft::Vector{T3}
+    pright::Vector{T3}
     affect!::T4
     correction::T5
     event_idx::Vector{T6}
@@ -71,7 +72,8 @@ TrackedAffect(t::Number, u, p, affect!::Nothing, correction) = nothing
 function TrackedAffect(t::Number, u, p, affect!, correction)
     return TrackedAffect(
         Vector{typeof(t)}(undef, 0), Vector{typeof(t)}(undef, 0),
-        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0), affect!,
+        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0),
+        Vector{typeof(p)}(undef, 0), affect!,
         correction,
         Vector{Int}(undef, 0)
     )
@@ -81,7 +83,8 @@ TrackedAffect_vcc(t::Number, u, p, affect!::Nothing, correction) = nothing
 function TrackedAffect_vcc(t::Number, u, p, affect!, correction)
     return TrackedAffect(
         Vector{typeof(t)}(undef, 0), Vector{typeof(t)}(undef, 0),
-        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0), affect!,
+        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0),
+        Vector{typeof(p)}(undef, 0), affect!,
         correction,
         Vector{Vector{Int8}}(undef, 0)
     )
@@ -132,6 +135,7 @@ function (f::TrackedAffect)(integrator, event_idx = nothing)
             push!(f.tprev, integrator.tprev)
             push!(f.uleft, uleft)
             push!(f.pleft, pleft)
+            push!(f.pright, deepcopy(integrator.p))
             if event_idx isa AbstractVector
                 push!(f.event_idx, copy(event_idx))
             elseif event_idx !== nothing

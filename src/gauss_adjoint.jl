@@ -1,8 +1,8 @@
 mutable struct GaussIntegrand{
-        pType, uType, lType, rateType, S, PF, PJC, PJT, DGP,
+        pType, uType, lType, rateType, PF, PJC, PJT, DGP,
         G, SAlg <: AbstractGAdjoint, tType, rType,
     }
-    sol::S
+    sol::Any
     p::pType
     y::uType
     λ::lType
@@ -37,23 +37,26 @@ struct ODEGaussAdjointSensitivityFunction{
     integrating_cb::ICB
 end
 
-mutable struct GaussCheckpointSolution{S, I, T, T2}
-    cpsol::S # solution in a checkpoint interval
+mutable struct GaussCheckpointSolution{I, T, T2, T3}
+    cpsol::Any # solution in a checkpoint interval
     intervals::I # checkpoint intervals
     cursor::Int # sol.prob.tspan = intervals[cursor]
     tols::T
     tstops::T2 # for callbacks
+    callback::T3 # tracked forward callback for local checkpoint reconstruction
 end
 
 function ODEGaussAdjointSensitivityFunction(
         g, sensealg, gaussint, discrete, sol, dgdu, dgdp,
         f, alg,
         checkpoints, integrating_cb, tols, tstops = nothing;
+        callback = CallbackSet(),
         tspan = reverse(sol.prob.tspan)
     )
     checkpointing = ischeckpointing(sensealg, sol)
     (checkpointing && checkpoints === nothing) &&
         error("checkpoints must be passed when checkpointing is enabled.")
+    checkpoint_callback = callback_with_saved_positions(callback)
     checkpoint_sol = if checkpointing
         intervals = map(tuple, @view(checkpoints[1:(end - 1)]), @view(checkpoints[2:end]))
         interval_end = intervals[end][end]
@@ -62,34 +65,31 @@ function ODEGaussAdjointSensitivityFunction(
         interval = intervals[cursor]
         if tstops === nothing
             cpsol = solve(
-                remake(sol.prob, tspan = interval, u0 = sol(interval[1])),
+                remake(sol.prob, tspan = interval, u0 = sol(interval[1], continuity = :right)),
                 sol.alg; dense = true, tols...
             )
             gaussint.sol = cpsol
         else
-            if maximum(interval[1] .< tstops .< interval[2])
-                # callback might have changed p
-                _p = Gaussreset_p(sol.prob.kwargs[:callback], interval)
-                #cpsol = solve(remake(sol.prob; tspan = interval, u0 = sol(interval[1])),
-                #    tstops, p = _p, sol.alg; tols...)
-
+            interval_tstops = Gaussinterval_tstops(tstops, interval)
+            _p = Gaussinterval_start_p(checkpoint_callback, interval, sol.prob.p)
+            interval_callback = Gaussinterval_callback(checkpoint_callback, interval)
+            if interval_tstops === nothing
+                prob′ = Gaussremake_checkpoint_prob(sol.prob, interval,
+                    sol(interval[1], continuity = :right), _p, interval_callback)
                 cpsol = solve(
-                    remake(sol.prob, tspan = interval, u0 = sol(interval[1])),
-                    dense = true,
-                    p = _p, sol.alg; tols...
+                    prob′, sol.alg; dense = true, tols...
                 )
                 gaussint.sol = cpsol
             else
-                #cpsol = solve(remake(sol.prob; tspan = interval, u0 = sol(interval[1])),
-                #    tstops, sol.alg; tols...)
+                prob′ = Gaussremake_checkpoint_prob(sol.prob, interval,
+                    sol(interval[1], continuity = :right), _p, interval_callback)
                 cpsol = solve(
-                    remake(sol.prob, tspan = interval, u0 = sol(interval[1])),
-                    sol.alg; dense = true, tols...
+                    prob′, sol.alg; dense = true, tstops = interval_tstops, tols...
                 )
                 gaussint.sol = cpsol
             end
         end
-        GaussCheckpointSolution(cpsol, intervals, cursor, tols, tstops)
+        GaussCheckpointSolution(cpsol, intervals, cursor, tols, tstops, checkpoint_callback)
     else
         nothing
     end
@@ -112,6 +112,85 @@ function Gaussfindcursor(intervals, t)
     # equivalent with `findfirst(x->x[1] <= t <= x[2], intervals)`
     lt(x, t) = <(x[2], t)
     return searchsortedfirst(intervals, t; lt)
+end
+
+function Gaussinterval_tstops(tstops, interval)
+    tstops === nothing && return nothing
+    local_tstops = filter(t -> interval[1] < t <= interval[2], tstops)
+    return isempty(local_tstops) ? nothing : local_tstops
+end
+
+function Gaussinterval_callback(callback::CallbackSet, interval)
+    isempty(callback.discrete_callbacks) && return callback
+    return CallbackSet(
+        callback.continuous_callbacks,
+        map(cb -> Gaussinterval_callback(cb, interval), callback.discrete_callbacks)
+    )
+end
+
+function Gaussinterval_callback(cb::DiscreteCallback, interval)
+    function condition(u, t, integrator)
+        return interval[1] < t <= interval[2] && cb.condition(u, t, integrator)
+    end
+    return DiscreteCallback(
+        condition, cb.affect!, cb.initialize, cb.finalize, cb.save_positions
+    )
+end
+
+function Gaussremake_checkpoint_prob(prob, interval, u0, p, callback)
+    prob_kwargs = (; prob.kwargs...)
+    return remake(prob, tspan = interval, u0 = u0, p = p,
+        kwargs = merge(prob_kwargs, (; callback)))
+end
+
+function Gaussinterval_start_p(callback, interval, fallback)
+    records = Tuple{typeof(interval[1]), Any, Any}[]
+    Gaussappend_p_records!(records, callback)
+    isempty(records) && return fallback
+
+    sort!(records; by = first)
+    t0 = interval[1]
+    next_record = findfirst(record -> record[1] > t0, records)
+    next_record !== nothing && return deepcopy(records[next_record][2])
+
+    prev_record = findlast(record -> record[1] <= t0, records)
+    if prev_record !== nothing
+        pright = records[prev_record][3]
+        pright === nothing &&
+            error("Tracked callback did not record right-hand parameters for checkpoint reconstruction.")
+        return deepcopy(pright)
+    end
+
+    return fallback
+end
+
+function Gaussappend_p_records!(records, callback::CallbackSet)
+    for cb in callback.discrete_callbacks
+        Gaussappend_p_records!(records, cb.affect!)
+    end
+    for cb in callback.continuous_callbacks
+        Gaussappend_p_records!(records, cb.affect!)
+        if hasproperty(cb, :affect_neg!)
+            Gaussappend_p_records!(records, cb.affect_neg!)
+        end
+    end
+    return records
+end
+
+function Gaussappend_p_records!(records, callback)
+    callback === nothing && return records
+    hasproperty(callback, :event_times) || return records
+    hasproperty(callback, :pleft) || return records
+    times = callback.event_times
+    for i in eachindex(times)
+        pright = if hasproperty(callback, :pright) && i <= length(callback.pright)
+            callback.pright[i]
+        else
+            nothing
+        end
+        push!(records, (times[i], callback.pleft[i], pright))
+    end
+    return records
 end
 
 # u = λ'
@@ -172,34 +251,35 @@ function split_states(du, u, t, S::ODEGaussAdjointSensitivityFunction; update = 
                 interval = intervals[cursor′]
                 cpsol_t = current_time(checkpoint_sol.cpsol)
                 if t isa ForwardDiff.Dual && eltype(S.y) <: AbstractFloat
-                    y = sol(interval[1])
+                    y = sol(interval[1], continuity = :right)
                 else
-                    sol(y, interval[1])
+                    sol(y, interval[1], continuity = :right)
                 end
                 if checkpoint_sol.tstops === nothing
                     prob′ = remake(prob, tspan = intervals[cursor′], u0 = y)
                     cpsol′ = solve(
                         prob′, sol.alg;
-                        dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
-                        checkpoint_sol.tols...
+                        dt = choose_dt(abs(cpsol_t[end] - cpsol_t[max(end - 1, firstindex(cpsol_t))]),
+                            cpsol_t, interval),
+                        dense = true, checkpoint_sol.tols...
                     )
                 else
-                    if maximum(interval[1] .< checkpoint_sol.tstops .< interval[2])
-                        # callback might have changed p
-                        _p = reset_p(prob.kwargs[:callback], interval)
-                        prob′ = remake(prob, tspan = intervals[cursor′], u0 = y, p = _p)
+                    interval_tstops = Gaussinterval_tstops(checkpoint_sol.tstops, interval)
+                    _p = Gaussinterval_start_p(checkpoint_sol.callback, interval, prob.p)
+                    interval_callback = Gaussinterval_callback(checkpoint_sol.callback, interval)
+                    dt = choose_dt(abs(cpsol_t[end] - cpsol_t[max(end - 1, firstindex(cpsol_t))]),
+                        cpsol_t, interval)
+                    if interval_tstops === nothing
+                        prob′ = Gaussremake_checkpoint_prob(prob, intervals[cursor′],
+                            y, _p, interval_callback)
                         cpsol′ = solve(
-                            prob′, sol.alg;
-                            dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
-                            tstops = checkpoint_sol.tstops,
-                            checkpoint_sol.tols...
+                            prob′, sol.alg; dt, dense = true, checkpoint_sol.tols...
                         )
                     else
-                        prob′ = remake(prob, tspan = intervals[cursor′], u0 = y)
+                        prob′ = Gaussremake_checkpoint_prob(prob, intervals[cursor′],
+                            y, _p, interval_callback)
                         cpsol′ = solve(
-                            prob′, sol.alg;
-                            dt = abs(cpsol_t[end] - cpsol_t[end - 1]),
-                            tstops = checkpoint_sol.tstops,
+                            prob′, sol.alg; dt, dense = true, tstops = interval_tstops,
                             checkpoint_sol.tols...
                         )
                     end
@@ -226,25 +306,28 @@ function Gaussupdate_checkpoint_sol!(S::ODEGaussAdjointSensitivityFunction, t)
         cursor′ = Gaussfindcursor(intervals, t)
         interval = intervals[cursor′]
         cpsol_t = current_time(checkpoint_sol.cpsol)
-        y₀ = sol(interval[1])
-        dt = abs(cpsol_t[end] - cpsol_t[end - 1])
+        y₀ = sol(interval[1], continuity = :right)
+        dt = choose_dt(abs(cpsol_t[end] - cpsol_t[max(end - 1, firstindex(cpsol_t))]),
+            cpsol_t, interval)
         if checkpoint_sol.tstops === nothing
             prob′ = remake(prob, tspan = intervals[cursor′], u0 = y₀)
-            cpsol′ = solve(prob′, sol.alg; dt, checkpoint_sol.tols...)
+            cpsol′ = solve(prob′, sol.alg; dt, dense = true, checkpoint_sol.tols...)
         else
-            if maximum(interval[1] .< checkpoint_sol.tstops .< interval[2])
-                # callback might have changed p
-                _p = reset_p(prob.kwargs[:callback], interval)
-                prob′ = remake(prob, tspan = intervals[cursor′], u0 = y₀, p = _p)
+            interval_tstops = Gaussinterval_tstops(checkpoint_sol.tstops, interval)
+            _p = Gaussinterval_start_p(checkpoint_sol.callback, interval, prob.p)
+            interval_callback = Gaussinterval_callback(checkpoint_sol.callback, interval)
+            if interval_tstops === nothing
+                prob′ = Gaussremake_checkpoint_prob(prob, intervals[cursor′],
+                    y₀, _p, interval_callback)
                 cpsol′ = solve(
-                    prob′, sol.alg; dt,
-                    tstops = checkpoint_sol.tstops, checkpoint_sol.tols...
+                    prob′, sol.alg; dt, dense = true, checkpoint_sol.tols...
                 )
             else
-                prob′ = remake(prob, tspan = intervals[cursor′], u0 = y₀)
+                prob′ = Gaussremake_checkpoint_prob(prob, intervals[cursor′],
+                    y₀, _p, interval_callback)
                 cpsol′ = solve(
-                    prob′, sol.alg; dt,
-                    tstops = checkpoint_sol.tstops, checkpoint_sol.tols...
+                    prob′, sol.alg; dt, dense = true, tstops = interval_tstops,
+                    checkpoint_sol.tols...
                 )
             end
         end
@@ -323,12 +406,20 @@ end
         )
     )
 
+    callback_tstops = checkpoints === nothing ?
+        callback_event_times(callback, typeof(tspan[1])) :
+        callback_event_times(callback, eltype(checkpoints))
+
     # remove duplicates from checkpoints
     if ischeckpointing(sensealg, sol) &&
             (length(unique(checkpoints)) != length(checkpoints))
         _checkpoints, duplicate_iterator_times = separate_nonunique(checkpoints)
         tstops = duplicate_iterator_times[1]
         checkpoints = filter(x -> x ∉ tstops, _checkpoints)
+        if !isempty(callback_tstops)
+            append!(tstops, callback_tstops)
+            sort!(unique!(tstops))
+        end
         # check if start is in checkpoints. Otherwise first interval is missed.
         if checkpoints[1] != tspan[2]
             pushfirst!(checkpoints, tspan[2])
@@ -343,7 +434,7 @@ end
             push!(checkpoints, tspan[1])
         end
     else
-        tstops = nothing
+        tstops = isempty(callback_tstops) ? nothing : callback_tstops
     end
 
     if ArrayInterface.ismutable(u0)
@@ -356,7 +447,7 @@ end
     sense = ODEGaussAdjointSensitivityFunction(
         g, sensealg, GaussInt, discrete, sol,
         dgdu_continuous, dgdp_continuous, f, alg, checkpoints, integrating_cb,
-        (; reltol, abstol), tstops; tspan
+        (; reltol, abstol), tstops; tspan, callback
     )
 
     init_cb = (discrete || dgdu_discrete !== nothing) # && tspan[1] == t[end]
@@ -779,13 +870,14 @@ function _adjoint_sensitivities(
         callback = CallbackSet(), no_start = false,
         kwargs...
     )
+    default_checkpoints = checkpoints === current_time(sol)
+    sol = event_replay_solution(sol, callback, alg, abstol, reltol)
+    default_checkpoints && (checkpoints = current_time(sol))
     p = SymbolicIndexingInterface.parameter_values(sol)
     if !isscimlstructure(p) && !isfunctor(p) &&
             !(p isa Union{Nothing, SciMLBase.NullParameters, AbstractArray})
         throw(SciMLStructuresCompatibilityError())
     end
-
-    sol = event_replay_solution(sol, callback, alg, abstol, reltol)
     _use_full_p = hasproperty(sensealg, :diff_tunables) &&
         sensealg.diff_tunables isa Val{false} &&
         isscimlstructure(p) && !(p isa AbstractArray)
