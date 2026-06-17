@@ -785,6 +785,7 @@ function _adjoint_sensitivities(
         throw(SciMLStructuresCompatibilityError())
     end
 
+    sol = event_replay_solution(sol, callback, alg, abstol, reltol)
     _use_full_p = hasproperty(sensealg, :diff_tunables) &&
         sensealg.diff_tunables isa Val{false} &&
         isscimlstructure(p) && !(p isa AbstractArray)

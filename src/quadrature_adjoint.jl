@@ -724,9 +724,15 @@ function _update_integrand_and_dgrad(
 
     wp = CallbackAffectPWrapper(cb, cb_autojacvec, pos_neg, event_idxs, tprev)
 
+    # The quadrature pass runs after the adjoint solve, so it does not execute
+    # reverse callbacks inside an integrator. Use the tracked forward left limit
+    # explicitly here, matching the reverse-callback path in callback_tracking.jl.
+    copy_to_integrator!(cb, integrand.y, integrand.p, indx, pos_neg)
+    p_left = copy(integrand.p)
+
     _p = similar(integrand.p, size(integrand.p))
     _p .= false
-    wp(_p, integrand.y, integrand.p, t)
+    wp(_p, integrand.y, copy(p_left), t)
 
     w = CallbackAffectWrapper(cb, cb_autojacvec, pos_neg, event_idxs, tprev)
     _y = copy(integrand.y)
@@ -743,12 +749,14 @@ function _update_integrand_and_dgrad(
         dgrad_p = similar(integrand.tunables)
         dgrad_p .*= false
         vecjacobian!(
-            nothing, integrand.y, res_vec, integrand.p, t, fakeSp;
+            nothing, integrand.y, res_vec, copy(p_left), t, fakeSp;
             dgrad = dgrad_p, dy = nothing
         )
         res .= dgrad_p'
-        integrand = update_p_integrand(integrand, _p)
+        integrand = update_p_integrand(integrand, p_left)
     end
+
+    _y == integrand.y && return integrand
 
     # Create a fake sensitivity function to do the vjps needs to be done
     # to account for parameter dependence of affect function

@@ -537,7 +537,6 @@ function SciMLBase._concrete_solve_adjoint(
             (p isa AbstractArray && !Base.isconcretetype(eltype(p)))
         throw(AdjointSensitivityParameterCompatibilityError())
     end
-
     # Check VJP compatibility for functor params
     if supports_functor_params(sensealg) && isfunctor(p) &&
             !supports_structured_vjp(sensealg.autojacvec)
@@ -562,7 +561,8 @@ function SciMLBase._concrete_solve_adjoint(
     kwargs_prob = NamedTuple(
         filter(
             x -> x[1] != :saveat && x[1] != :save_start &&
-                x[1] != :save_end && x[1] != :save_idxs,
+                x[1] != :save_end && x[1] != :save_idxs &&
+                x[1] != :callback,
             prob.kwargs
         )
     )
@@ -573,7 +573,7 @@ function SciMLBase._concrete_solve_adjoint(
             state_values(prob), parameter_values(prob),
             sensealg
         )
-        _prob = remake(prob; u0, p, kwargs = merge(kwargs_prob, (; callback = cb)))
+        _prob = remake(prob; u0, p, kwargs = kwargs_prob)
     else
         cb = nothing
         _prob = remake(prob; u0, p, kwargs = kwargs_prob)
@@ -588,7 +588,12 @@ function SciMLBase._concrete_solve_adjoint(
         ),
     }(values(kwargs))
     kwargs_dense_fwd = NamedTuple(
-        filter(x -> x[1] != :dense && x[1] != :save_everystep, pairs(kwargs_fwd))
+        filter(
+            x -> x[1] != :dense && x[1] != :save_everystep &&
+                x[1] != :saveat && x[1] != :save_start &&
+                x[1] != :save_end && x[1] != :save_idxs,
+            pairs(kwargs_fwd)
+        )
     )
 
     # Capture the callback_adj for the reverse pass and remove both callbacks
@@ -686,24 +691,50 @@ function SciMLBase._concrete_solve_adjoint(
     _prob = remake(_prob, u0 = new_u0, p = new_p)
 
     if sensealg isa BacksolveAdjoint
-        sol = solve(
-            _prob, alg, args...; initializealg = new_initializealg, save_noise = true,
-            save_start, save_end,
-            saveat, kwargs_fwd...
-        )
+        sol = if cb === nothing
+            solve(
+                _prob, alg, args...; initializealg = new_initializealg,
+                save_noise = true, save_start, save_end,
+                saveat, kwargs_fwd...
+            )
+        else
+            solve(
+                _prob, alg, args...; callback = cb,
+                initializealg = new_initializealg, save_noise = true,
+                save_start, save_end, saveat, kwargs_fwd...
+            )
+        end
     elseif ischeckpointing(sensealg)
-        sol = solve(
-            _prob, alg, args...; initializealg = new_initializealg, save_noise = true,
-            save_start = true, save_end = true,
-            saveat, kwargs_fwd...
-        )
+        sol = if cb === nothing
+            solve(
+                _prob, alg, args...; initializealg = new_initializealg,
+                save_noise = true, save_start = true, save_end = true,
+                saveat, kwargs_fwd...
+            )
+        else
+            solve(
+                _prob, alg, args...; callback = cb,
+                initializealg = new_initializealg, save_noise = true,
+                save_start = true, save_end = true, saveat, kwargs_fwd...
+            )
+        end
     else
-        sol = solve(
-            _prob, alg, args...; initializealg = new_initializealg,
-            save_noise = true, save_start = true,
-            save_end = true, dense = true, save_everystep = true,
-            kwargs_dense_fwd...
-        )
+        sol = if cb === nothing
+            solve(
+                _prob, alg, args...; initializealg = new_initializealg,
+                save_noise = true, save_start = true,
+                save_end = true, dense = true, save_everystep = true,
+                kwargs_dense_fwd...
+            )
+        else
+            cb_forward = callback_with_saved_positions(cb)
+            solve(
+                _prob, alg, args...; callback = cb_forward,
+                initializealg = new_initializealg, save_noise = true,
+                save_start = true, save_end = true, dense = true,
+                save_everystep = true, kwargs_dense_fwd...
+            )
+        end
     end
 
     # Force `save_start` and `save_end` in the forward pass This forces the

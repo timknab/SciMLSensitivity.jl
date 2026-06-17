@@ -333,7 +333,7 @@ function _setup_reverse_callbacks(
         du = first(get_tmp_cache(integrator))
         λ, grad, y, dλ, dgrad, dy = split_states(du, integrator.u, integrator.t, S)
 
-        if sensealg isa GaussAdjoint
+        if sensealg isa AbstractGAdjoint
             dgrad = integrator.f.f.integrating_cb.affect!.accumulation_cache
             recursive_copyto!(dgrad, 0)
         end
@@ -402,7 +402,7 @@ function _setup_reverse_callbacks(
                 )
                 #vjp with Jacobin given by dw/dp before event and vector given by grad
 
-                if sensealg isa GaussAdjoint
+                if sensealg isa AbstractGAdjoint
                     vecjacobian!(
                         nothing, y,
                         integrator.f.f.integrating_cb.affect!.integrand_values.integrand,
@@ -446,7 +446,7 @@ function _setup_reverse_callbacks(
 
         λ .= dλ
 
-        return if sensealg isa GaussAdjoint
+        return if sensealg isa AbstractGAdjoint
             @assert integrator.f.f isa ODEGaussAdjointSensitivityFunction
             integrator.f.f.integrating_cb.affect!.integrand_values.integrand .-= dgrad
 
@@ -531,9 +531,22 @@ end
 function get_FakeIntegrator(autojacvec::ReverseDiffVJP, u, p, t, tprev)
     return FakeIntegrator([x for x in u], [x for x in p], t, tprev)
 end
-get_FakeIntegrator(autojacvec::EnzymeVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
-get_FakeIntegrator(autojacvec::ReactantVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
-get_FakeIntegrator(autojacvec::MooncakeVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
+
+_copy_fake_integrator_arg(x) = copy(x)
+_copy_fake_integrator_arg(x::SciMLBase.NullParameters) = x
+_copy_fake_integrator_arg(::Nothing) = nothing
+
+function get_FakeIntegrator(
+        autojacvec::Union{EnzymeVJP, ReactantVJP, MooncakeVJP},
+        u, p, t, tprev
+    )
+    return FakeIntegrator(
+        _copy_fake_integrator_arg(u),
+        _copy_fake_integrator_arg(p),
+        t,
+        tprev,
+    )
+end
 
 function _get_wp_paramjac_config(autojacvec::EnzymeVJP, _p, wp, y, __p, _t)
     return (zero(y), zero(_p), zero(_p), zero(_p), zero(y))

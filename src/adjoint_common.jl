@@ -153,22 +153,27 @@ function callback_with_saved_positions(cb::VectorContinuousCallback)
     )
 end
 
-function event_replay_solution(sol, callback, alg, abstol, reltol)
-    callback === nothing && return sol
-    event_times = callback_event_times(callback, typeof(sol.prob.tspan[1]))
-    isempty(event_times) && return sol
+function solution_interp_sensitivitymode(sol)
+    interp = sol.interp
+    interp === nothing && return false
+    return hasproperty(interp, :sensitivitymode) && getproperty(interp, :sensitivitymode)
+end
 
-    replay_callback = callback_with_saved_positions(callback)
+function event_replay_solution(sol, callback, alg, abstol, reltol)
+    event_times = callback_event_times(callback, typeof(sol.prob.tspan[1]))
+    isempty(event_times) && !solution_interp_sensitivitymode(sol) && return sol
+
+    replay_callback = callback === nothing ? nothing : callback_with_saved_positions(callback)
     replay_p = callback_initial_p(callback, sol.prob.p)
     replay_prob = remake(sol.prob, u0 = sol.prob.u0, p = replay_p)
     solve_kwargs = (;
-        callback = replay_callback,
-        tstops = event_times,
         save_everystep = true,
         save_start = true,
         save_end = true,
         dense = true
     )
+    replay_callback === nothing || (solve_kwargs = (; solve_kwargs..., callback = replay_callback))
+    isempty(event_times) || (solve_kwargs = (; solve_kwargs..., tstops = event_times))
     abstol === nothing || (solve_kwargs = (; solve_kwargs..., abstol))
     reltol === nothing || (solve_kwargs = (; solve_kwargs..., reltol))
     replay_sol = solve(replay_prob, alg; solve_kwargs...)
