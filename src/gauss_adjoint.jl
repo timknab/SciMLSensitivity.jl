@@ -891,6 +891,24 @@ function _adjoint_sensitivities(
         end
     end
 
+    # Discrete dgdp (∂g_k/∂p, the direct cost–parameter dependence at the
+    # discrete observation times) is accumulated into the augmented parameter
+    # state by the ReverseLossCallback only on the non-quadrature path
+    # (`!isq`). GaussAdjoint carries no augmented parameter state — the
+    # parameter gradient is the separate quadrature `res` — so that term is
+    # dropped here and must be added explicitly, or any parameter that appears
+    # directly in the loss/observation function (not just through the dynamics)
+    # gets a wrong gradient.
+    if dgdp_discrete !== nothing && t !== nothing
+        gp = mutable_zeros(tunables)
+        yy_d = similar(sol.prob.u0)
+        for k in eachindex(t)
+            sol(yy_d, t[k])
+            dgdp_discrete(gp, yy_d, p, t[k], k)
+            res .+= gp
+        end
+    end
+
     return state_values(adj_sol)[end], __maybe_adjoint(res)
 end
 
