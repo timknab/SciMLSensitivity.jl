@@ -62,6 +62,7 @@ struct TrackedAffect{T, T2, T3, T4, T5, T6}
     tprev::Vector{T}
     uleft::Vector{T2}
     pleft::Vector{T3}
+    pright::Vector{T3}
     affect!::T4
     correction::T5
     event_idx::Vector{T6}
@@ -71,7 +72,8 @@ TrackedAffect(t::Number, u, p, affect!::Nothing, correction) = nothing
 function TrackedAffect(t::Number, u, p, affect!, correction)
     return TrackedAffect(
         Vector{typeof(t)}(undef, 0), Vector{typeof(t)}(undef, 0),
-        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0), affect!,
+        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0),
+        Vector{typeof(p)}(undef, 0), affect!,
         correction,
         Vector{Int}(undef, 0)
     )
@@ -81,7 +83,8 @@ TrackedAffect_vcc(t::Number, u, p, affect!::Nothing, correction) = nothing
 function TrackedAffect_vcc(t::Number, u, p, affect!, correction)
     return TrackedAffect(
         Vector{typeof(t)}(undef, 0), Vector{typeof(t)}(undef, 0),
-        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0), affect!,
+        Vector{typeof(u)}(undef, 0), Vector{typeof(p)}(undef, 0),
+        Vector{typeof(p)}(undef, 0), affect!,
         correction,
         Vector{Vector{Int8}}(undef, 0)
     )
@@ -132,6 +135,7 @@ function (f::TrackedAffect)(integrator, event_idx = nothing)
             push!(f.tprev, integrator.tprev)
             push!(f.uleft, uleft)
             push!(f.pleft, pleft)
+            push!(f.pright, deepcopy(integrator.p))
             if event_idx isa AbstractVector
                 push!(f.event_idx, copy(event_idx))
             elseif event_idx !== nothing
@@ -333,7 +337,7 @@ function _setup_reverse_callbacks(
         du = first(get_tmp_cache(integrator))
         λ, grad, y, dλ, dgrad, dy = split_states(du, integrator.u, integrator.t, S)
 
-        if sensealg isa GaussAdjoint
+        if sensealg isa AbstractGAdjoint
             dgrad = integrator.f.f.integrating_cb.affect!.accumulation_cache
             recursive_copyto!(dgrad, 0)
         end
@@ -346,8 +350,7 @@ function _setup_reverse_callbacks(
         # if save_positions[2] = false, then the right limit is not saved. Thus, for
         # the QuadratureAdjoint we would need to lift y from the left to the right limit.
         # However, one also needs to update dgrad later on.
-        if (sensealg isa QuadratureAdjoint && !cb.save_positions[2]) ||
-                (sensealg isa InterpolatingAdjoint && ischeckpointing(sensealg))
+        if sensealg isa QuadratureAdjoint && !cb.save_positions[2]
             w(y, y, integrator.p, integrator.t)
         end
 
@@ -403,7 +406,7 @@ function _setup_reverse_callbacks(
                 )
                 #vjp with Jacobin given by dw/dp before event and vector given by grad
 
-                if sensealg isa GaussAdjoint
+                if sensealg isa AbstractGAdjoint
                     vecjacobian!(
                         nothing, y,
                         integrator.f.f.integrating_cb.affect!.integrand_values.integrand,
@@ -447,7 +450,7 @@ function _setup_reverse_callbacks(
 
         λ .= dλ
 
-        return if sensealg isa GaussAdjoint
+        return if sensealg isa AbstractGAdjoint
             @assert integrator.f.f isa ODEGaussAdjointSensitivityFunction
             integrator.f.f.integrating_cb.affect!.integrand_values.integrand .-= dgrad
 
@@ -532,9 +535,22 @@ end
 function get_FakeIntegrator(autojacvec::ReverseDiffVJP, u, p, t, tprev)
     return FakeIntegrator([x for x in u], [x for x in p], t, tprev)
 end
-get_FakeIntegrator(autojacvec::EnzymeVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
-get_FakeIntegrator(autojacvec::ReactantVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
-get_FakeIntegrator(autojacvec::MooncakeVJP, u, p, t, tprev) = FakeIntegrator(u, p, t, tprev)
+
+_copy_fake_integrator_arg(x) = copy(x)
+_copy_fake_integrator_arg(x::SciMLBase.NullParameters) = x
+_copy_fake_integrator_arg(::Nothing) = nothing
+
+function get_FakeIntegrator(
+        autojacvec::Union{EnzymeVJP, ReactantVJP, MooncakeVJP},
+        u, p, t, tprev
+    )
+    return FakeIntegrator(
+        _copy_fake_integrator_arg(u),
+        _copy_fake_integrator_arg(p),
+        t,
+        tprev,
+    )
+end
 
 function _get_wp_paramjac_config(autojacvec::EnzymeVJP, _p, wp, y, __p, _t)
     return (zero(y), zero(_p), zero(_p), zero(_p), zero(y))

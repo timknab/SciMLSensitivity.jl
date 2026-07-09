@@ -34,6 +34,243 @@ struct AdjointDiffCache{
     repack::rType
 end
 
+function callback_event_times(callback, ::Type{T}) where {T}
+    times = T[]
+    callback === nothing && return times
+    for cb in callback.discrete_callbacks
+        _append_callback_event_times!(times, cb.affect!, T)
+    end
+    for cb in callback.continuous_callbacks
+        _append_callback_event_times!(times, cb.affect!, T)
+        hasproperty(cb, :affect_neg!) &&
+            _append_callback_event_times!(times, cb.affect_neg!, T)
+    end
+    return sort!(unique!(times))
+end
+
+function callback_event_times(
+        callback::Union{DiscreteCallback, ContinuousCallback, VectorContinuousCallback},
+        ::Type{T}
+    ) where {T}
+    return callback_event_times(CallbackSet(callback), T)
+end
+
+function _append_callback_event_times!(times, affect, ::Type{T}) where {T}
+    affect === nothing && return times
+    hasproperty(affect, :event_times) || return times
+    append!(times, convert.(T, affect.event_times))
+    return times
+end
+
+function callback_initial_p(callback, fallback)
+    callback === nothing && return fallback
+    tfirst = nothing
+    pfirst = nothing
+    for cb in callback.discrete_callbacks
+        tfirst, pfirst = _callback_initial_p(tfirst, pfirst, cb.affect!)
+    end
+    for cb in callback.continuous_callbacks
+        tfirst, pfirst = _callback_initial_p(tfirst, pfirst, cb.affect!)
+        if hasproperty(cb, :affect_neg!)
+            tfirst, pfirst = _callback_initial_p(tfirst, pfirst, cb.affect_neg!)
+        end
+    end
+    return pfirst === nothing ? fallback : deepcopy(pfirst)
+end
+
+function callback_initial_p(
+        callback::Union{DiscreteCallback, ContinuousCallback, VectorContinuousCallback},
+        fallback
+    )
+    return callback_initial_p(CallbackSet(callback), fallback)
+end
+
+function _callback_initial_p(tfirst, pfirst, affect)
+    affect === nothing && return tfirst, pfirst
+    hasproperty(affect, :event_times) || return tfirst, pfirst
+    hasproperty(affect, :pleft) || return tfirst, pfirst
+    isempty(affect.event_times) && return tfirst, pfirst
+    idx = firstindex(affect.event_times)
+    t = affect.event_times[idx]
+    if tfirst === nothing || t < tfirst
+        return t, affect.pleft[idx]
+    end
+    return tfirst, pfirst
+end
+
+function callback_final_p(callback, fallback)
+    callback === nothing && return fallback
+    tlast = nothing
+    plast = nothing
+    for cb in callback.discrete_callbacks
+        tlast, plast = _callback_final_p(tlast, plast, cb.affect!)
+    end
+    for cb in callback.continuous_callbacks
+        tlast, plast = _callback_final_p(tlast, plast, cb.affect!)
+        if hasproperty(cb, :affect_neg!)
+            tlast, plast = _callback_final_p(tlast, plast, cb.affect_neg!)
+        end
+    end
+    return plast === nothing ? fallback : deepcopy(plast)
+end
+
+function callback_final_p(
+        callback::Union{DiscreteCallback, ContinuousCallback, VectorContinuousCallback},
+        fallback
+    )
+    return callback_final_p(CallbackSet(callback), fallback)
+end
+
+function _callback_final_p(tlast, plast, affect)
+    affect === nothing && return tlast, plast
+    hasproperty(affect, :event_times) || return tlast, plast
+    hasproperty(affect, :pright) || return tlast, plast
+    isempty(affect.event_times) && return tlast, plast
+    idx = lastindex(affect.event_times)
+    t = affect.event_times[idx]
+    if tlast === nothing || t >= tlast
+        return t, affect.pright[idx]
+    end
+    return tlast, plast
+end
+
+function callback_interval_start_p(callback, interval)
+    callback === nothing && return nothing
+    candidates = []
+    order = 0
+    for cb in callback.discrete_callbacks
+        order += 1
+        _append_callback_interval_start_p!(candidates, order, cb.affect!, interval)
+    end
+    for cb in callback.continuous_callbacks
+        order += 1
+        _append_callback_interval_start_p!(candidates, order, cb.affect!, interval)
+        if hasproperty(cb, :affect_neg!)
+            order += 1
+            _append_callback_interval_start_p!(
+                candidates, order, cb.affect_neg!, interval
+            )
+        end
+    end
+    isempty(candidates) && return callback_final_p(callback, nothing)
+    sort!(candidates, by = candidate -> (candidate[1], candidate[2]))
+    return deepcopy(candidates[1][3])
+end
+
+function callback_interval_start_p(
+        callback::Union{DiscreteCallback, ContinuousCallback, VectorContinuousCallback},
+        interval
+    )
+    return callback_interval_start_p(CallbackSet(callback), interval)
+end
+
+function _append_callback_interval_start_p!(candidates, order, affect, interval)
+    affect === nothing && return candidates
+    hasproperty(affect, :event_times) || return candidates
+    hasproperty(affect, :pleft) || return candidates
+    idx = _first_callback_event_after_interval_start(affect.event_times, interval)
+    idx === nothing && return candidates
+    push!(candidates, (affect.event_times[idx], order, affect.pleft[idx]))
+    return candidates
+end
+
+function _first_callback_event_after_interval_start(event_times, interval)
+    isempty(event_times) && return nothing
+    idx = searchsortedfirst(event_times, interval[1])
+    while idx <= lastindex(event_times) && event_times[idx] <= interval[1]
+        idx += 1
+    end
+    idx > lastindex(event_times) && return nothing
+    return idx
+end
+
+callback_with_saved_positions(callback) = callback
+
+function callback_with_saved_positions(callback::CallbackSet)
+    return CallbackSet(
+        map(callback_with_saved_positions, callback.continuous_callbacks),
+        map(callback_with_saved_positions, callback.discrete_callbacks)
+    )
+end
+
+function callback_with_saved_positions(cb::DiscreteCallback)
+    return DiscreteCallback(
+        cb.condition, cb.affect!, cb.initialize, cb.finalize, (true, true)
+    )
+end
+
+function callback_with_saved_positions(cb::ContinuousCallback)
+    return ContinuousCallback(
+        cb.condition,
+        cb.affect!,
+        cb.affect_neg!,
+        cb.initialize,
+        cb.finalize,
+        cb.idxs,
+        cb.rootfind,
+        cb.interp_points,
+        (true, true),
+        cb.dtrelax,
+        cb.abstol,
+        cb.reltol,
+        cb.repeat_nudge
+    )
+end
+
+function callback_with_saved_positions(cb::VectorContinuousCallback)
+    return VectorContinuousCallback(
+        cb.condition,
+        cb.affect!,
+        cb.len,
+        cb.initialize,
+        cb.finalize,
+        cb.idxs,
+        cb.rootfind,
+        cb.interp_points,
+        collect((true, true)),
+        cb.dtrelax,
+        cb.abstol,
+        cb.reltol,
+        cb.repeat_nudge,
+        cb.initializealg,
+        cb.saved_clock_partitions,
+        cb.maybe_discontinuity,
+        cb.initialize_save_discretes
+    )
+end
+
+function solution_interp_sensitivitymode(sol)
+    interp = sol.interp
+    interp === nothing && return false
+    return hasproperty(interp, :sensitivitymode) && getproperty(interp, :sensitivitymode)
+end
+
+function event_replay_solution(sol, callback, alg, abstol, reltol)
+    event_times = callback_event_times(callback, typeof(sol.prob.tspan[1]))
+    isempty(event_times) && !solution_interp_sensitivitymode(sol) && return sol
+
+    replay_callback = callback === nothing ? nothing : callback_with_saved_positions(callback)
+    replay_p = callback_initial_p(callback, sol.prob.p)
+    prob_kwargs = (; sol.prob.kwargs...)
+    replay_prob_kwargs = replay_callback === nothing ?
+        prob_kwargs : merge(prob_kwargs, (; callback = replay_callback))
+    replay_prob = remake(sol.prob, u0 = sol.prob.u0, p = replay_p,
+        kwargs = replay_prob_kwargs)
+    solve_kwargs = (;
+        save_everystep = true,
+        save_start = true,
+        save_end = true,
+        dense = true
+    )
+    isempty(event_times) || (solve_kwargs = (; solve_kwargs..., tstops = event_times))
+    abstol === nothing || (solve_kwargs = (; solve_kwargs..., abstol))
+    reltol === nothing || (solve_kwargs = (; solve_kwargs..., reltol))
+    replay_sol = solve(replay_prob, alg; solve_kwargs...)
+    SciMLBase.successful_retcode(replay_sol) ||
+        error("event-aware adjoint replay solve failed with retcode $(replay_sol.retcode)")
+    return replay_sol
+end
+
 """
     adjointdiffcache(g,sensealg,discrete,sol,dg,alg;quad=false)
 

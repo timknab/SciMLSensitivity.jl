@@ -536,7 +536,6 @@ function SciMLBase._concrete_solve_adjoint(
             (p isa AbstractArray && !Base.isconcretetype(eltype(p)))
         throw(AdjointSensitivityParameterCompatibilityError())
     end
-
     # Check VJP compatibility for functor params
     if supports_functor_params(sensealg) && isfunctor(p) &&
             !supports_structured_vjp(sensealg.autojacvec)
@@ -561,7 +560,8 @@ function SciMLBase._concrete_solve_adjoint(
     kwargs_prob = NamedTuple(
         filter(
             x -> x[1] != :saveat && x[1] != :save_start &&
-                x[1] != :save_end && x[1] != :save_idxs,
+                x[1] != :save_end && x[1] != :save_idxs &&
+                x[1] != :callback,
             prob.kwargs
         )
     )
@@ -572,7 +572,7 @@ function SciMLBase._concrete_solve_adjoint(
             state_values(prob), parameter_values(prob),
             sensealg
         )
-        _prob = remake(prob; u0, p, kwargs = merge(kwargs_prob, (; callback = cb)))
+        _prob = remake(prob; u0, p, kwargs = kwargs_prob)
     else
         cb = nothing
         _prob = remake(prob; u0, p, kwargs = kwargs_prob)
@@ -586,6 +586,14 @@ function SciMLBase._concrete_solve_adjoint(
             )
         ),
     }(values(kwargs))
+    kwargs_dense_fwd = NamedTuple(
+        filter(
+            x -> x[1] != :dense && x[1] != :save_everystep &&
+                x[1] != :saveat && x[1] != :save_start &&
+                x[1] != :save_end && x[1] != :save_idxs,
+            pairs(kwargs_fwd)
+        )
+    )
 
     # Capture the callback_adj for the reverse pass and remove both callbacks
     kwargs_adj = NamedTuple{
@@ -596,6 +604,12 @@ function SciMLBase._concrete_solve_adjoint(
     }(values(kwargs))
     isq = sensealg isa QuadratureAdjoint
     kwargs_init = kwargs_adj[Base.diff_names(Base._nt_names(kwargs_adj), (:initializealg,))]
+    kwargs_reverse = NamedTuple(
+        filter(
+            x -> x[1] != :dense && x[1] != :save_everystep && x[1] != :tstops,
+            pairs(kwargs_init)
+        )
+    )
 
     if haskey(kwargs, :initializealg) || haskey(prob.kwargs, :initializealg)
         initializealg = haskey(kwargs, :initializealg) ? kwargs[:initializealg] :
@@ -676,23 +690,50 @@ function SciMLBase._concrete_solve_adjoint(
     _prob = remake(_prob, u0 = new_u0, p = new_p)
 
     if sensealg isa BacksolveAdjoint
-        sol = solve(
-            _prob, alg, args...; initializealg = new_initializealg, save_noise = true,
-            save_start, save_end,
-            saveat, kwargs_fwd...
-        )
+        sol = if cb === nothing
+            solve(
+                _prob, alg, args...; initializealg = new_initializealg,
+                save_noise = true, save_start, save_end,
+                saveat, kwargs_fwd...
+            )
+        else
+            solve(
+                _prob, alg, args...; callback = cb,
+                initializealg = new_initializealg, save_noise = true,
+                save_start, save_end, saveat, kwargs_fwd...
+            )
+        end
     elseif ischeckpointing(sensealg)
-        sol = solve(
-            _prob, alg, args...; initializealg = new_initializealg, save_noise = true,
-            save_start = true, save_end = true,
-            saveat, kwargs_fwd...
-        )
+        sol = if cb === nothing
+            solve(
+                _prob, alg, args...; initializealg = new_initializealg,
+                save_noise = true, save_start = true, save_end = true,
+                saveat, kwargs_fwd...
+            )
+        else
+            solve(
+                _prob, alg, args...; callback = cb,
+                initializealg = new_initializealg, save_noise = true,
+                save_start = true, save_end = true, saveat, kwargs_fwd...
+            )
+        end
     else
-        sol = solve(
-            _prob, alg, args...; initializealg = new_initializealg,
-            save_noise = true, save_start = true,
-            save_end = true, kwargs_fwd...
-        )
+        sol = if cb === nothing
+            solve(
+                _prob, alg, args...; initializealg = new_initializealg,
+                save_noise = true, save_start = true,
+                save_end = true, dense = true, save_everystep = true,
+                kwargs_dense_fwd...
+            )
+        else
+            cb_forward = callback_with_saved_positions(cb)
+            solve(
+                _prob, alg, args...; callback = cb_forward,
+                initializealg = new_initializealg, save_noise = true,
+                save_start = true, save_end = true, dense = true,
+                save_everystep = true, kwargs_dense_fwd...
+            )
+        end
     end
 
     # Force `save_start` and `save_end` in the forward pass This forces the
@@ -703,6 +744,7 @@ function SciMLBase._concrete_solve_adjoint(
         # Saving behavior unchanged
         ts = current_time(sol)
         only_end = length(ts) == 1 && ts[1] == _prob.tspan[2]
+        adjoint_sol = sol
         out = SciMLBase.sensitivity_solution(sol, state_values(sol), ts)
     elseif saveat isa Number
         if _prob.tspan[2] > _prob.tspan[1]
@@ -725,6 +767,7 @@ function SciMLBase._concrete_solve_adjoint(
             _outf = getu(_out, save_idxs)
             out = SciMLBase.sensitivity_solution(sol, _outf(_out), ts)
         end
+        adjoint_sol = SciMLBase.sensitivity_solution(sol, state_values(_out), ts)
         only_end = length(ts) == 1 && ts[1] == _prob.tspan[2]
     elseif isempty(saveat)
         no_start = !save_start
@@ -736,6 +779,7 @@ function SciMLBase._concrete_solve_adjoint(
         _u = sol.u[sol_idxs]
         u = save_idxs === nothing ? _u : [x[save_idxs] for x in _u]
         ts = current_time(sol, sol_idxs)
+        adjoint_sol = SciMLBase.sensitivity_solution(sol, _u, ts)
         out = SciMLBase.sensitivity_solution(sol, u, ts)
     else
         _saveat = saveat isa Array ? sort(saveat) : saveat # for minibatching
@@ -755,10 +799,12 @@ function SciMLBase._concrete_solve_adjoint(
             _outf = getu(_out, save_idxs)
             out = SciMLBase.sensitivity_solution(sol, _outf(_out), ts)
         end
+        adjoint_sol = SciMLBase.sensitivity_solution(sol, state_values(_out), ts)
         only_end = length(ts) == 1 && ts[1] == _prob.tspan[2]
     end
 
     @reset out.prob = prob
+    @reset adjoint_sol.prob = prob
 
     _save_idxs = save_idxs === nothing ? Colon() : save_idxs
 
@@ -944,23 +990,23 @@ function SciMLBase._concrete_solve_adjoint(
         if prob isa Union{ODEProblem, DAEProblem}
             du0,
                 dp = adjoint_sensitivities(
-                sol, alg, args...; t = ts,
+                adjoint_sol, alg, args...; t = ts,
                 dgdu_discrete = ArrayInterface.ismutable(eltype(state_values(sol))) ?
                     df_iip : df_oop,
                 sensealg,
                 callback = cb2, no_start = !save_start && _prob.tspan[1] ∈ ts,
                 initializealg = BrownFullBasicInit(),
-                kwargs_init...
+                kwargs_reverse...
             )
         else
             du0,
                 dp = adjoint_sensitivities(
-                sol, alg, args...; t = ts,
+                adjoint_sol, alg, args...; t = ts,
                 dgdu_discrete = ArrayInterface.ismutable(eltype(state_values(sol))) ?
                     df_iip : df_oop,
                 sensealg,
                 callback = cb2, no_start = !save_start && _prob.tspan[2] ∈ ts,
-                kwargs_init...
+                kwargs_reverse...
             )
         end
 

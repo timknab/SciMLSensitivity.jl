@@ -1,0 +1,368 @@
+using DifferentiationInterface
+using DiffEqCallbacks
+using ForwardDiff
+using LinearAlgebra
+using Mooncake
+using OrdinaryDiffEq
+using SciMLBase
+using SciMLSensitivity
+using Test
+
+const ADJ_REPLAY_TSPAN = (0.0, 3.0)
+const ADJ_REPLAY_EVENT_TIMES = [0.5, 1.0, 1.75, 2.25]
+const ADJ_REPLAY_OBS_TIMES = [0.25, 0.75, 1.25, 2.0, 2.75]
+const ADJ_REPLAY_ABSTOL = 1.0e-10
+const ADJ_REPLAY_RELTOL = 1.0e-10
+const ADJ_REPLAY_SIGMA = 0.15
+const ADJ_REPLAY_NOISE = [0.03, -0.015, 0.02, -0.025, 0.01]
+const ADJ_REPLAY_X_DATA = log.([0.38, 1.15, 0.72])
+const ADJ_REPLAY_X0 = log.([0.43, 1.05, 0.85])
+
+function adj_replay_rhs!(du, u, p, t)
+    du[1] = -p[1] * u[1] + p[3]
+    return nothing
+end
+
+function adj_replay_problem(x::AbstractVector)
+    k = exp(x[1])
+    u0 = [exp(x[2])]
+    scale = exp(x[3])
+    p = [k, scale, zero(k + scale)]
+    return ODEProblem(adj_replay_rhs!, u0, ADJ_REPLAY_TSPAN, p)
+end
+
+function adj_replay_action!(integrator, idx::Integer)
+    if idx == 1
+        integrator.u[1] += 0.35 * integrator.p[2]
+    elseif idx == 2
+        integrator.p[3] += 0.18 * integrator.p[2]
+    elseif idx == 3
+        integrator.p[2] = 1.12 * integrator.p[2]
+    elseif idx == 4
+        integrator.p[3] -= 0.18 * integrator.p[2]
+    else
+        error("unknown event index $idx")
+    end
+    return nothing
+end
+
+function adj_replay_vector_callback()
+    function condition(out, u, t, integrator)
+        @inbounds for i in eachindex(ADJ_REPLAY_EVENT_TIMES)
+            out[i] = t - ADJ_REPLAY_EVENT_TIMES[i]
+        end
+        return nothing
+    end
+    function affect!(integrator, event_mask)
+        if event_mask isa Integer
+            adj_replay_action!(integrator, Int(event_mask))
+            return nothing
+        end
+        @inbounds for i in eachindex(ADJ_REPLAY_EVENT_TIMES)
+            iszero(event_mask[i]) || adj_replay_action!(integrator, i)
+        end
+        return nothing
+    end
+    return VectorContinuousCallback(
+        condition, affect!, length(ADJ_REPLAY_EVENT_TIMES);
+        save_positions = (false, false),
+        interp_points = 0
+    )
+end
+
+function adj_replay_discrete_callback()
+    function matching_event_indices(t)
+        return findall(
+            tt -> isapprox(t, tt; rtol = 0.0, atol = 1.0e-12),
+            ADJ_REPLAY_EVENT_TIMES
+        )
+    end
+    condition(u, t, integrator) = !isempty(matching_event_indices(t))
+    function affect!(integrator)
+        for i in matching_event_indices(integrator.t)
+            adj_replay_action!(integrator, i)
+        end
+        return nothing
+    end
+    return DiscreteCallback(condition, affect!; save_positions = (false, false))
+end
+
+function adj_replay_callback(kind::Symbol)
+    kind === :vector && return adj_replay_vector_callback(), (;)
+    kind === :discrete &&
+        return adj_replay_discrete_callback(), (; tstops = ADJ_REPLAY_EVENT_TIMES)
+    error("unknown callback kind $kind")
+end
+
+function adj_replay_predictions(sol)
+    preds = similar(ADJ_REPLAY_OBS_TIMES, eltype(sol.u[1]))
+    for (i, t_obs) in pairs(ADJ_REPLAY_OBS_TIMES)
+        idx = findfirst(
+            t -> isapprox(t, t_obs; rtol = 0.0, atol = 1.0e-9),
+            sol.t
+        )
+        idx === nothing && error("solution did not save observation time $t_obs")
+        preds[i] = sol.u[idx][1]
+    end
+    return preds
+end
+
+function adj_replay_solve(x::AbstractVector, callback_kind::Symbol; sensealg = nothing)
+    cb, cb_kwargs = adj_replay_callback(callback_kind)
+    kwargs = sensealg === nothing ? (;) : (; sensealg)
+    sol = solve(
+        adj_replay_problem(x), Tsit5();
+        callback = cb,
+        saveat = ADJ_REPLAY_OBS_TIMES,
+        save_start = false,
+        save_end = false,
+        save_everystep = false,
+        dense = false,
+        abstol = ADJ_REPLAY_ABSTOL,
+        reltol = ADJ_REPLAY_RELTOL,
+        cb_kwargs...,
+        kwargs...
+    )
+    SciMLBase.successful_retcode(sol) ||
+        error("solve failed with retcode $(sol.retcode)")
+    return adj_replay_predictions(sol)
+end
+
+function adj_replay_observations(callback_kind::Symbol)
+    return adj_replay_solve(ADJ_REPLAY_X_DATA, callback_kind) .+ ADJ_REPLAY_NOISE
+end
+
+function adj_replay_objective(
+        x::AbstractVector, callback_kind::Symbol; sensealg = nothing)
+    pred = adj_replay_solve(x, callback_kind; sensealg)
+    resid = (pred .- adj_replay_observations(callback_kind)) ./ ADJ_REPLAY_SIGMA
+    return -0.5 * sum(abs2, resid) - 0.025 * sum(abs2, x)
+end
+
+function adj_replay_value_gradient(f, x)
+    value, grad = DifferentiationInterface.value_and_gradient(
+        f, DifferentiationInterface.AutoMooncake(), x)
+    return value, collect(grad)
+end
+
+adj_replay_rel_l2(a, b) = norm(a .- b) / max(norm(b), eps(Float64))
+
+function adj_replay_sensealgs()
+    sensealgs = [
+        (
+            "InterpolatingAdjoint MooncakeVJP",
+            InterpolatingAdjoint(;
+                autojacvec = SciMLSensitivity.MooncakeVJP(),
+                checkpointing = false
+            )
+        ),
+        (
+            "checkpointed InterpolatingAdjoint MooncakeVJP",
+            InterpolatingAdjoint(;
+                autojacvec = SciMLSensitivity.MooncakeVJP(),
+                checkpointing = true
+            )
+        ),
+        (
+            "QuadratureAdjoint MooncakeVJP",
+            QuadratureAdjoint(;
+                autojacvec = SciMLSensitivity.MooncakeVJP(),
+                abstol = ADJ_REPLAY_ABSTOL,
+                reltol = ADJ_REPLAY_RELTOL
+            )
+        )
+    ]
+
+    if VERSION < v"1.12"
+        append!(
+            sensealgs,
+            [
+                (
+                    "InterpolatingAdjoint EnzymeVJP",
+                    InterpolatingAdjoint(;
+                        autojacvec = SciMLSensitivity.EnzymeVJP(),
+                        checkpointing = false
+                    )
+                ),
+                (
+                    "QuadratureAdjoint EnzymeVJP",
+                    QuadratureAdjoint(;
+                        autojacvec = SciMLSensitivity.EnzymeVJP(),
+                        abstol = ADJ_REPLAY_ABSTOL,
+                        reltol = ADJ_REPLAY_RELTOL
+                    )
+                )
+            ]
+        )
+    end
+
+    return sensealgs
+end
+
+const ADJ_FORCE_TSPAN = (0.0, 12.0)
+const ADJ_FORCE_OBS_TIMES = [0.0, 0.4, 1.4, 2.25, 3.8, 4.4, 5.8, 7.5, 9.5, 11.5]
+const ADJ_FORCE_ACTION_TIMES = [0.0, 4.0, 5.5]
+const ADJ_FORCE_TSTOPS = [0.0, 1.5, 4.0, 5.5, 7.0, 9.0]
+const ADJ_FORCE_THETA_DATA = [0.0, 0.18 * exp(0.11), 1.0]
+const ADJ_FORCE_THETA0 = [0.0, 0.18 * exp(0.08), 1.0]
+const ADJ_FORCE_SIGMA = 0.3
+
+struct ADJReplayStateForcingODEFunction{F, FS}
+    f!::F
+    forcings::FS
+end
+
+function (f::ADJReplayStateForcingODEFunction)(du, u, p, t)
+    f.f!(du, u, p, t)
+    for forcing in f.forcings
+        if forcing.start <= t < forcing.stop
+            du[forcing.index] += forcing.rate
+        end
+    end
+    return nothing
+end
+
+const ADJ_FORCE_FORCINGS = (
+    (index = 1, start = 0.0, stop = 1.5, rate = 12.0),
+    (index = 1, start = 7.0, stop = 9.0, rate = 8.0)
+)
+
+function adj_force_base_rhs!(du, u, p, t)
+    du[1] = -p[1] * p[2] * u[1]
+    return nothing
+end
+
+function adj_force_problem(theta)
+    f! = ADJReplayStateForcingODEFunction(adj_force_base_rhs!, ADJ_FORCE_FORCINGS)
+    return ODEProblem(f!, [theta[1]], ADJ_FORCE_TSPAN, [theta[2], theta[3]])
+end
+
+function adj_force_action!(integrator, time)
+    if time == 0.0
+        integrator.p[2] = 0.80
+        integrator.u[1] += 75.0
+    elseif time == 4.0
+        integrator.p[2] = 1.35
+    elseif time == 5.5
+        integrator.u[1] += 32.0
+    else
+        error("unexpected force action time $time")
+    end
+    return nothing
+end
+
+function adj_force_callback()
+    callbacks = map(ADJ_FORCE_ACTION_TIMES) do time
+        PresetTimeCallback(
+            time,
+            integrator -> adj_force_action!(integrator, time);
+            save_positions = (false, false),
+            sort_inplace = false
+        )
+    end
+    return CallbackSet(callbacks...)
+end
+
+function adj_force_predictions(sol)
+    return [sol(t)[1] for t in ADJ_FORCE_OBS_TIMES]
+end
+
+function adj_force_observations()
+    sol = solve(
+        adj_force_problem(ADJ_FORCE_THETA_DATA), Tsit5();
+        callback = adj_force_callback(),
+        tstops = ADJ_FORCE_TSTOPS,
+        dense = false,
+        saveat = ADJ_FORCE_OBS_TIMES,
+        save_start = false,
+        save_end = false,
+        save_everystep = false,
+        abstol = ADJ_REPLAY_ABSTOL,
+        reltol = ADJ_REPLAY_RELTOL
+    )
+    return adj_force_predictions(sol) .+ 0.003 .* cos.(ADJ_FORCE_OBS_TIMES)
+end
+
+function adj_force_direct_gradient(sensealg)
+    y = adj_force_observations()
+    prob = adj_force_problem(ADJ_FORCE_THETA0)
+    callback = track_callbacks(
+        adj_force_callback(), ADJ_FORCE_TSPAN[1], prob.u0, prob.p, sensealg)
+    sol = solve(
+        prob, Tsit5();
+        callback,
+        tstops = ADJ_FORCE_TSTOPS,
+        dense = true,
+        save_start = true,
+        save_end = true,
+        save_everystep = true,
+        abstol = ADJ_REPLAY_ABSTOL,
+        reltol = ADJ_REPLAY_RELTOL
+    )
+    SciMLBase.successful_retcode(sol) ||
+        error("solve failed with retcode $(sol.retcode)")
+
+    function dgdu_discrete(out, u, p, t, i)
+        obs_idx = findfirst(
+            tt -> isapprox(t, tt; rtol = 0.0, atol = 1.0e-9),
+            ADJ_FORCE_OBS_TIMES
+        )
+        obs_idx === nothing && error("unexpected loss time $t")
+        out[1] = -(u[1] - y[obs_idx]) / (ADJ_FORCE_SIGMA^2)
+        return nothing
+    end
+
+    du0, dp = adjoint_sensitivities(
+        sol, Tsit5();
+        t = ADJ_FORCE_OBS_TIMES,
+        dgdu_discrete,
+        callback,
+        sensealg,
+        abstol = ADJ_REPLAY_ABSTOL,
+        reltol = ADJ_REPLAY_RELTOL
+    )
+    return vcat(vec(collect(du0)), vec(collect(dp)))
+end
+
+@testset "callback-aware adjoint replay" begin
+    for callback_kind in (:discrete, :vector)
+        @testset "$callback_kind callback" begin
+            ref_f = x -> adj_replay_objective(x, callback_kind)
+            ref_value = ref_f(ADJ_REPLAY_X0)
+            ref_grad = ForwardDiff.gradient(ref_f, ADJ_REPLAY_X0)
+
+            for (name, sensealg) in adj_replay_sensealgs()
+                @testset "$name" begin
+                    f = x -> adj_replay_objective(x, callback_kind; sensealg)
+                    value, grad = adj_replay_value_gradient(f, ADJ_REPLAY_X0)
+
+                    @test value ≈ ref_value atol = 1.0e-9 rtol = 1.0e-9
+                    @test adj_replay_rel_l2(grad, ref_grad) ≤ 1.0e-8
+                end
+            end
+        end
+    end
+
+    @testset "direct quadrature replay after parameter callbacks" begin
+        interpolating = InterpolatingAdjoint(;
+            autojacvec = SciMLSensitivity.MooncakeVJP(),
+            checkpointing = false
+        )
+        checkpointed_interpolating = InterpolatingAdjoint(;
+            autojacvec = SciMLSensitivity.MooncakeVJP(),
+            checkpointing = true
+        )
+        quadrature = QuadratureAdjoint(;
+            autojacvec = SciMLSensitivity.MooncakeVJP(),
+            abstol = ADJ_REPLAY_ABSTOL,
+            reltol = ADJ_REPLAY_RELTOL
+        )
+
+        grad_interpolating = adj_force_direct_gradient(interpolating)
+        grad_checkpointed = adj_force_direct_gradient(checkpointed_interpolating)
+        grad_quadrature = adj_force_direct_gradient(quadrature)
+
+        @test adj_replay_rel_l2(grad_checkpointed, grad_interpolating) ≤ 1.0e-8
+        @test adj_replay_rel_l2(grad_quadrature, grad_interpolating) ≤ 1.0e-8
+    end
+end
